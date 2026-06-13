@@ -3,49 +3,67 @@ import { useParams, Link } from "react-router-dom";
 import { Save, Download, RefreshCw, ArrowLeft, BarChart3 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { QrCode, UpdateQrCodeRequest } from "@shared/types";
-import { useCollaboration } from "@/hooks/useCollaboration";
+import { useCollab } from "@/collab/useCollab";
+import type { RemoteChange } from "@/collab/useCollab";
 import OnlineUsers from "@/components/OnlineUsers";
 import ConflictDialog from "@/components/ConflictDialog";
 import QrCodeForm, { type FormState } from "@/components/QrCodeForm";
 import QrCodePreview from "@/components/QrCodePreview";
-import type { RemoteChange } from "@/types/collab";
 
-const FIELDS: (keyof FormState)[] = ["name", "targetUrl", "size", "foreground", "background", "errorLevel", "logoDataUrl"];
+const FIELD_KEYS: (keyof FormState)[] = [
+  "name", "targetUrl", "size", "foreground", "background", "errorLevel", "logoDataUrl"
+];
+
+function apiDataToForm(qr: QrCode): FormState {
+  return {
+    name: qr.name,
+    targetUrl: qr.targetUrl,
+    size: qr.size,
+    foreground: qr.foreground,
+    background: qr.background,
+    errorLevel: qr.errorLevel,
+    logoDataUrl: qr.logoDataUrl,
+  };
+}
 
 export default function QrCodeEdit() {
   const { id = "" } = useParams();
+
   const [qr, setQr] = useState<QrCode | null>(null);
   const [form, setForm] = useState<FormState | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [formInitialized, setFormInitialized] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const qrRef = useRef<HTMLDivElement>(null);
+
   const lastSentRef = useRef<Record<string, unknown>>({});
-  const lastAppliedRemoteRef = useRef<Record<string, number>>({});
   const debounceTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
-  const formRef = useRef<FormState | null>(null);
   const apiDataRef = useRef<FormState | null>(null);
-  const apiLoadedRef = useRef(false);
-  const formInitializedRef = useRef(false);
+  const focusedFieldRef = useRef<string | null>(null);
+  const formRef = useRef<FormState | null>(null);
 
   formRef.current = form;
 
-  const collab = useCollaboration(id);
+  const collab = useCollab(id);
 
   const applyRemoteChange = useCallback((change: RemoteChange) => {
     const field = change.field as keyof FormState;
-    if (!FIELDS.includes(field)) return;
+    if (!FIELD_KEYS.includes(field)) return;
 
-    const lastApplied = lastAppliedRemoteRef.current[field] || 0;
-    if (change.operation.revision <= lastApplied) return;
-    lastAppliedRemoteRef.current[field] = change.operation.revision;
+    lastSentRef.current[field] = change.value;
 
     setForm((prev) => {
       if (!prev) return prev;
       if (prev[field] === change.value) return prev;
-      const updated = { ...prev, [field]: change.value };
+
+      if (focusedFieldRef.current === field && field !== "size" && field !== "errorLevel") {
+        return prev;
+      }
+
+      const updated = { ...prev, [field]: change.value as never };
       formRef.current = updated;
-      lastSentRef.current[field] = change.value;
       return updated;
     });
   }, []);
@@ -58,21 +76,18 @@ export default function QrCodeEdit() {
   }, [collab, applyRemoteChange]);
 
   useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+
     api
       .getQrCode(id)
       .then((data) => {
+        if (cancelled) return;
         setQr(data);
-        apiDataRef.current = {
-          name: data.name,
-          targetUrl: data.targetUrl,
-          size: data.size,
-          foreground: data.foreground,
-          background: data.background,
-          errorLevel: data.errorLevel,
-          logoDataUrl: data.logoDataUrl,
-        };
+        apiDataRef.current = apiDataToForm(data);
       })
       .catch(() => {
+        if (cancelled) return;
         const mock: QrCode = {
           id,
           name: "示例二维码-编辑",
@@ -89,57 +104,49 @@ export default function QrCodeEdit() {
           updatedAt: new Date().toISOString(),
         };
         setQr(mock);
-        apiDataRef.current = {
-          name: mock.name,
-          targetUrl: mock.targetUrl,
-          size: mock.size,
-          foreground: mock.foreground,
-          background: mock.background,
-          errorLevel: mock.errorLevel,
-        };
-      })
-      .finally(() => {
-        apiLoadedRef.current = true;
-        setLoading(false);
+        apiDataRef.current = apiDataToForm(mock);
       });
+
+    return () => { cancelled = true; };
   }, [id]);
 
   useEffect(() => {
-    if (formInitializedRef.current) return;
-    if (!apiLoadedRef.current || !apiDataRef.current) return;
+    if (formInitialized) return;
+    if (!apiDataRef.current) return;
+    if (!collab.syncReady) return;
 
-    if (collab.syncReady && collab.syncedState && Object.keys(collab.syncedState).length > 0) {
-      formInitializedRef.current = true;
-      const baseForm = apiDataRef.current;
-      const syncState = collab.syncedState;
+    const base = apiDataRef.current;
+    const sync = collab.syncedFields;
 
-      const merged: FormState = { ...baseForm };
-      for (const key of FIELDS) {
-        if (syncState[key] !== undefined) {
-          (merged as unknown as Record<string, unknown>)[key] = syncState[key];
+    if (sync && Object.keys(sync).length > 0) {
+      const merged = { ...base };
+      for (const key of FIELD_KEYS) {
+        if (sync[key] !== undefined && sync[key] !== null) {
+          (merged as unknown as Record<string, unknown>)[key] = sync[key];
         }
       }
-
       setForm(merged);
       formRef.current = merged;
-      for (const key of FIELDS) {
+      for (const key of FIELD_KEYS) {
         lastSentRef.current[key] = merged[key];
       }
-    } else if (collab.syncReady) {
-      formInitializedRef.current = true;
-      const initialForm = apiDataRef.current;
-      setForm(initialForm);
-      formRef.current = initialForm;
-      for (const key of FIELDS) {
-        lastSentRef.current[key] = initialForm[key];
+    } else {
+      setForm(base);
+      formRef.current = base;
+      for (const key of FIELD_KEYS) {
+        lastSentRef.current[key] = base[key];
       }
     }
-  }, [collab.syncReady, collab.syncedState]);
+
+    setFormInitialized(true);
+    setLoading(false);
+  }, [collab.syncReady, collab.syncedFields, formInitialized]);
 
   const updateField = useCallback(<K extends keyof FormState>(key: K, value: FormState[K]) => {
-    setForm((f) => {
-      if (!f) return f;
-      const updated = { ...f, [key]: value };
+    setForm((prev) => {
+      if (!prev) return prev;
+      if (prev[key] === value) return prev;
+      const updated = { ...prev, [key]: value };
       formRef.current = updated;
       return updated;
     });
@@ -158,10 +165,14 @@ export default function QrCodeEdit() {
   }, [collab]);
 
   const handleFieldFocus = useCallback((field: string) => {
+    focusedFieldRef.current = field;
     collab.sendFieldFocus(field);
   }, [collab]);
 
   const handleFieldBlur = useCallback((field: string) => {
+    if (focusedFieldRef.current === field) {
+      focusedFieldRef.current = null;
+    }
     collab.sendFieldBlur(field);
   }, [collab]);
 
@@ -213,35 +224,35 @@ export default function QrCodeEdit() {
   };
 
   const handleReset = () => {
-    if (qr) {
-      const resetForm: FormState = {
-        name: qr.name,
-        targetUrl: qr.targetUrl,
-        size: qr.size,
-        foreground: qr.foreground,
-        background: qr.background,
-        errorLevel: qr.errorLevel,
-        logoDataUrl: qr.logoDataUrl,
-      };
+    if (qr && apiDataRef.current) {
+      const resetForm = apiDataToForm(qr);
+      apiDataRef.current = resetForm;
       setForm(resetForm);
       formRef.current = resetForm;
-      lastSentRef.current = {};
-      lastAppliedRemoteRef.current = {};
+      for (const key of FIELD_KEYS) {
+        lastSentRef.current[key] = resetForm[key];
+      }
     }
   };
 
   const handleResolveConflict = useCallback((field: string, resolution: 'yours' | 'theirs', yourValue: unknown) => {
     const conflict = collab.conflicts.find((c) => c.field === field);
-    const theirValue = conflict?.theirValue;
+    if (!conflict) return;
 
     collab.resolveConflict(field, resolution, yourValue);
 
+    const theirValue = conflict.theirValue;
     const resolvedValue = resolution === 'yours' ? yourValue : theirValue;
-    if (resolvedValue !== undefined && formRef.current) {
-      const updated = { ...formRef.current, [field as keyof FormState]: resolvedValue as never };
-      formRef.current = updated;
-      setForm(updated);
-      lastSentRef.current[field] = resolvedValue;
+
+    lastSentRef.current[field] = resolvedValue;
+
+    if (resolution === 'theirs') {
+      setForm((prev) => {
+        if (!prev) return prev;
+        const updated = { ...prev, [field]: theirValue as never };
+        formRef.current = updated;
+        return updated;
+      });
     }
   }, [collab]);
 
@@ -270,9 +281,7 @@ export default function QrCodeEdit() {
     }
   };
 
-  const formReady = loading === false && form !== null && formInitializedRef.current;
-
-  if (!formReady) {
+  if (loading || !form) {
     return (
       <div className="card p-12 text-center text-dark-400">
         <RefreshCw className="w-8 h-8 animate-spin mx-auto mb-3" />

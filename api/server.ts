@@ -1,5 +1,5 @@
 import app from './app.js'
-import { initWebSocket } from './websocket.js'
+import { initCollabWebSocket } from './collab/CollabServer.js'
 
 const PORT = process.env.PORT || 3001
 
@@ -7,8 +7,8 @@ const server = app.listen(PORT, () => {
   console.log(`Server ready on port ${PORT}`)
 })
 
-initWebSocket(server)
-console.log('WebSocket server initialized on /ws/collab')
+initCollabWebSocket(server)
+console.log('Collab WebSocket initialized on /ws/collab')
 
 process.on('SIGTERM', () => {
   console.log('SIGTERM signal received')
