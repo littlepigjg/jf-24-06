@@ -1,47 +1,19 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useParams, useNavigate, Link } from "react-router-dom";
-import { QRCodeCanvas } from "qrcode.react";
-import {
-  Upload,
-  Save,
-  Download,
-  RefreshCw,
-  X,
-  Palette,
-  Link2,
-  Hash,
-  Maximize2,
-  ArrowLeft,
-  BarChart3,
-} from "lucide-react";
+import { useParams, Link } from "react-router-dom";
+import { Save, Download, RefreshCw, ArrowLeft, BarChart3 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { QrCode, UpdateQrCodeRequest, ErrorLevel } from "@shared/types";
+import type { QrCode, UpdateQrCodeRequest } from "@shared/types";
 import { useCollaboration } from "@/hooks/useCollaboration";
 import OnlineUsers from "@/components/OnlineUsers";
-import { CollabFieldIndicator } from "@/components/CollabCursors";
 import ConflictDialog from "@/components/ConflictDialog";
+import QrCodeForm, { type FormState } from "@/components/QrCodeForm";
+import QrCodePreview from "@/components/QrCodePreview";
+import type { RemoteChange } from "@/types/collab";
 
-interface FormState {
-  name: string;
-  targetUrl: string;
-  size: number;
-  foreground: string;
-  background: string;
-  errorLevel: ErrorLevel;
-  logoDataUrl?: string;
-}
-
-const sizeOptions = [128, 192, 256, 384, 512];
-const errorLevelOptions: { value: ErrorLevel; label: string }[] = [
-  { value: "L", label: "低 L (~7%)" },
-  { value: "M", label: "中 M (~15%)" },
-  { value: "Q", label: "较高 Q (~25%)" },
-  { value: "H", label: "高 H (~30%)" },
-];
+const FIELDS: (keyof FormState)[] = ["name", "targetUrl", "size", "foreground", "background", "errorLevel", "logoDataUrl"];
 
 export default function QrCodeEdit() {
   const { id = "" } = useParams();
-  const navigate = useNavigate();
   const [qr, setQr] = useState<QrCode | null>(null);
   const [form, setForm] = useState<FormState | null>(null);
   const [loading, setLoading] = useState(true);
@@ -49,16 +21,48 @@ export default function QrCodeEdit() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const qrRef = useRef<HTMLDivElement>(null);
   const lastSentRef = useRef<Record<string, unknown>>({});
+  const lastAppliedRemoteRef = useRef<Record<string, number>>({});
   const debounceTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const formRef = useRef<FormState | null>(null);
+  const apiDataRef = useRef<FormState | null>(null);
+  const apiLoadedRef = useRef(false);
+  const formInitializedRef = useRef(false);
+
+  formRef.current = form;
 
   const collab = useCollaboration(id);
+
+  const applyRemoteChange = useCallback((change: RemoteChange) => {
+    const field = change.field as keyof FormState;
+    if (!FIELDS.includes(field)) return;
+
+    const lastApplied = lastAppliedRemoteRef.current[field] || 0;
+    if (change.operation.revision <= lastApplied) return;
+    lastAppliedRemoteRef.current[field] = change.operation.revision;
+
+    setForm((prev) => {
+      if (!prev) return prev;
+      if (prev[field] === change.value) return prev;
+      const updated = { ...prev, [field]: change.value };
+      formRef.current = updated;
+      lastSentRef.current[field] = change.value;
+      return updated;
+    });
+  }, []);
+
+  useEffect(() => {
+    const unregister = collab.onRemoteChange((change) => {
+      applyRemoteChange(change);
+    });
+    return unregister;
+  }, [collab, applyRemoteChange]);
 
   useEffect(() => {
     api
       .getQrCode(id)
       .then((data) => {
         setQr(data);
-        setForm({
+        apiDataRef.current = {
           name: data.name,
           targetUrl: data.targetUrl,
           size: data.size,
@@ -66,7 +70,7 @@ export default function QrCodeEdit() {
           background: data.background,
           errorLevel: data.errorLevel,
           logoDataUrl: data.logoDataUrl,
-        });
+        };
       })
       .catch(() => {
         const mock: QrCode = {
@@ -85,55 +89,60 @@ export default function QrCodeEdit() {
           updatedAt: new Date().toISOString(),
         };
         setQr(mock);
-        setForm({
+        apiDataRef.current = {
           name: mock.name,
           targetUrl: mock.targetUrl,
           size: mock.size,
           foreground: mock.foreground,
           background: mock.background,
           errorLevel: mock.errorLevel,
-        });
+        };
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        apiLoadedRef.current = true;
+        setLoading(false);
+      });
   }, [id]);
 
   useEffect(() => {
-    if (collab.syncedState && form) {
-      setForm((prev) => {
-        if (!prev) return prev;
-        const updated = { ...prev };
-        const state = collab.syncedState!;
-        if (state.name !== undefined) updated.name = state.name as string;
-        if (state.targetUrl !== undefined) updated.targetUrl = state.targetUrl as string;
-        if (state.size !== undefined) updated.size = state.size as number;
-        if (state.foreground !== undefined) updated.foreground = state.foreground as string;
-        if (state.background !== undefined) updated.background = state.background as string;
-        if (state.errorLevel !== undefined) updated.errorLevel = state.errorLevel as ErrorLevel;
-        if (state.logoDataUrl !== undefined) updated.logoDataUrl = state.logoDataUrl as string;
-        return updated;
-      });
-    }
-  }, [collab.syncedState]);
+    if (formInitializedRef.current) return;
+    if (!apiLoadedRef.current || !apiDataRef.current) return;
 
-  useEffect(() => {
-    const changes = collab.consumeAllRemoteChanges();
-    if (changes.length > 0 && form) {
-      setForm((prev) => {
-        if (!prev) return prev;
-        const updated = { ...prev };
-        for (const change of changes) {
-          const key = change.field as keyof FormState;
-          if (key in updated) {
-            (updated as Record<string, unknown>)[key] = change.value;
-          }
+    if (collab.syncReady && collab.syncedState && Object.keys(collab.syncedState).length > 0) {
+      formInitializedRef.current = true;
+      const baseForm = apiDataRef.current;
+      const syncState = collab.syncedState;
+
+      const merged: FormState = { ...baseForm };
+      for (const key of FIELDS) {
+        if (syncState[key] !== undefined) {
+          (merged as unknown as Record<string, unknown>)[key] = syncState[key];
         }
-        return updated;
-      });
+      }
+
+      setForm(merged);
+      formRef.current = merged;
+      for (const key of FIELDS) {
+        lastSentRef.current[key] = merged[key];
+      }
+    } else if (collab.syncReady) {
+      formInitializedRef.current = true;
+      const initialForm = apiDataRef.current;
+      setForm(initialForm);
+      formRef.current = initialForm;
+      for (const key of FIELDS) {
+        lastSentRef.current[key] = initialForm[key];
+      }
     }
-  });
+  }, [collab.syncReady, collab.syncedState]);
 
   const updateField = useCallback(<K extends keyof FormState>(key: K, value: FormState[K]) => {
-    setForm((f) => (f ? { ...f, [key]: value } : f));
+    setForm((f) => {
+      if (!f) return f;
+      const updated = { ...f, [key]: value };
+      formRef.current = updated;
+      return updated;
+    });
 
     const oldVal = lastSentRef.current[key];
     if (oldVal === value) return;
@@ -205,7 +214,7 @@ export default function QrCodeEdit() {
 
   const handleReset = () => {
     if (qr) {
-      setForm({
+      const resetForm: FormState = {
         name: qr.name,
         targetUrl: qr.targetUrl,
         size: qr.size,
@@ -213,10 +222,28 @@ export default function QrCodeEdit() {
         background: qr.background,
         errorLevel: qr.errorLevel,
         logoDataUrl: qr.logoDataUrl,
-      });
+      };
+      setForm(resetForm);
+      formRef.current = resetForm;
       lastSentRef.current = {};
+      lastAppliedRemoteRef.current = {};
     }
   };
+
+  const handleResolveConflict = useCallback((field: string, resolution: 'yours' | 'theirs', yourValue: unknown) => {
+    const conflict = collab.conflicts.find((c) => c.field === field);
+    const theirValue = conflict?.theirValue;
+
+    collab.resolveConflict(field, resolution, yourValue);
+
+    const resolvedValue = resolution === 'yours' ? yourValue : theirValue;
+    if (resolvedValue !== undefined && formRef.current) {
+      const updated = { ...formRef.current, [field as keyof FormState]: resolvedValue as never };
+      formRef.current = updated;
+      setForm(updated);
+      lastSentRef.current[field] = resolvedValue;
+    }
+  }, [collab]);
 
   const handleDownloadPreview = () => {
     const canvas = qrRef.current?.querySelector("canvas");
@@ -243,7 +270,9 @@ export default function QrCodeEdit() {
     }
   };
 
-  if (loading || !form) {
+  const formReady = loading === false && form !== null && formInitializedRef.current;
+
+  if (!formReady) {
     return (
       <div className="card p-12 text-center text-dark-400">
         <RefreshCw className="w-8 h-8 animate-spin mx-auto mb-3" />
@@ -252,13 +281,11 @@ export default function QrCodeEdit() {
     );
   }
 
-  const previewValue = form.targetUrl && form.targetUrl.length > 8 ? form.targetUrl : "https://example.com";
-
   return (
     <div className="space-y-6">
       <ConflictDialog
         conflicts={collab.conflicts}
-        onResolve={collab.resolveConflict}
+        onResolve={handleResolveConflict}
       />
 
       <div className="flex items-center justify-between flex-wrap gap-4">
@@ -295,186 +322,16 @@ export default function QrCodeEdit() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-        <form id="qr-form" onSubmit={handleSubmit} className="lg:col-span-3 space-y-5">
-          <div className="card p-5 space-y-5">
-            <div className="grid grid-cols-1 gap-4">
-              <div data-collab-field="name">
-                <label className="label">
-                  <Hash className="w-3.5 h-3.5 inline mr-1" />
-                  二维码名称 *
-                </label>
-                <input
-                  type="text"
-                  className="input"
-                  placeholder="例如：活动海报-2024春季"
-                  value={form.name}
-                  onChange={(e) => updateField("name", e.target.value)}
-                  onFocus={() => handleFieldFocus("name")}
-                  onBlur={() => handleFieldBlur("name")}
-                />
-                <CollabFieldIndicator users={collab.remoteUsers} field="name" />
-              </div>
-
-              <div data-collab-field="targetUrl">
-                <label className="label">
-                  <Link2 className="w-3.5 h-3.5 inline mr-1" />
-                  目标URL *
-                </label>
-                <input
-                  type="url"
-                  className="input"
-                  placeholder="https://example.com/your-page"
-                  value={form.targetUrl}
-                  onChange={(e) => updateField("targetUrl", e.target.value)}
-                  onFocus={() => handleFieldFocus("targetUrl")}
-                  onBlur={() => handleFieldBlur("targetUrl")}
-                />
-                {qr?.type === "static" && (
-                  <p className="text-xs text-warning-500 mt-1">
-                    ⚠ 静态码已生成，修改目标URL后旧码将失效
-                  </p>
-                )}
-                <CollabFieldIndicator users={collab.remoteUsers} field="targetUrl" />
-              </div>
-            </div>
-          </div>
-
-          <div className="card p-5 space-y-5">
-            <h3 className="font-semibold text-white flex items-center gap-2">
-              <Palette className="w-4 h-4 text-brand-400" />
-              样式配置
-            </h3>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div data-collab-field="size">
-                <label className="label">
-                  <Maximize2 className="w-3.5 h-3.5 inline mr-1" />
-                  尺寸
-                </label>
-                <div className="flex flex-wrap gap-2">
-                  {sizeOptions.map((s) => (
-                    <button
-                      key={s}
-                      type="button"
-                      onClick={() => updateField("size", s)}
-                      onFocus={() => handleFieldFocus("size")}
-                      onBlur={() => handleFieldBlur("size")}
-                      className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
-                        form.size === s
-                          ? "bg-brand-gradient text-white shadow-glow-sm"
-                          : "bg-dark-700 text-dark-300 hover:bg-dark-600"
-                      }`}
-                    >
-                      {s}px
-                    </button>
-                  ))}
-                </div>
-                <CollabFieldIndicator users={collab.remoteUsers} field="size" />
-              </div>
-
-              <div data-collab-field="errorLevel">
-                <label className="label">容错级别</label>
-                <select
-                  className="input"
-                  value={form.errorLevel}
-                  onChange={(e) => updateField("errorLevel", e.target.value as ErrorLevel)}
-                  onFocus={() => handleFieldFocus("errorLevel")}
-                  onBlur={() => handleFieldBlur("errorLevel")}
-                >
-                  {errorLevelOptions.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-                <CollabFieldIndicator users={collab.remoteUsers} field="errorLevel" />
-              </div>
-
-              <div data-collab-field="foreground">
-                <label className="label">前景色</label>
-                <div className="flex gap-2">
-                  <input
-                    type="color"
-                    className="w-12 h-10 rounded-lg bg-dark-700 border border-dark-600 cursor-pointer p-1"
-                    value={form.foreground}
-                    onChange={(e) => updateField("foreground", e.target.value)}
-                    onFocus={() => handleFieldFocus("foreground")}
-                    onBlur={() => handleFieldBlur("foreground")}
-                  />
-                  <input
-                    type="text"
-                    className="input flex-1 font-mono text-sm"
-                    value={form.foreground}
-                    onChange={(e) => updateField("foreground", e.target.value)}
-                    onFocus={() => handleFieldFocus("foreground")}
-                    onBlur={() => handleFieldBlur("foreground")}
-                  />
-                </div>
-                <CollabFieldIndicator users={collab.remoteUsers} field="foreground" />
-              </div>
-
-              <div data-collab-field="background">
-                <label className="label">背景色</label>
-                <div className="flex gap-2">
-                  <input
-                    type="color"
-                    className="w-12 h-10 rounded-lg bg-dark-700 border border-dark-600 cursor-pointer p-1"
-                    value={form.background}
-                    onChange={(e) => updateField("background", e.target.value)}
-                    onFocus={() => handleFieldFocus("background")}
-                    onBlur={() => handleFieldBlur("background")}
-                  />
-                  <input
-                    type="text"
-                    className="input flex-1 font-mono text-sm"
-                    value={form.background}
-                    onChange={(e) => updateField("background", e.target.value)}
-                    onFocus={() => handleFieldFocus("background")}
-                    onBlur={() => handleFieldBlur("background")}
-                  />
-                </div>
-                <CollabFieldIndicator users={collab.remoteUsers} field="background" />
-              </div>
-
-              <div className="md:col-span-2" data-collab-field="logoDataUrl">
-                <label className="label">中心 Logo （可选，建议2MB以内）</label>
-                <div className="flex items-start gap-3 flex-wrap">
-                  <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-secondary">
-                    <Upload className="w-4 h-4" />
-                    上传 Logo
-                  </button>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/*"
-                    onChange={handleLogoUpload}
-                    className="hidden"
-                  />
-                  {form.logoDataUrl && (
-                    <div className="relative group">
-                      <img
-                        src={form.logoDataUrl}
-                        alt="logo preview"
-                        className="w-16 h-16 rounded-lg object-contain bg-white border border-dark-600 p-1"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => updateField("logoDataUrl", undefined)}
-                        className="absolute -top-2 -right-2 w-6 h-6 rounded-full bg-danger-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  )}
-                  <p className="text-xs text-dark-500 pt-2">
-                    建议使用正方形 PNG，容错级别建议选 Q 或 H
-                  </p>
-                </div>
-                <CollabFieldIndicator users={collab.remoteUsers} field="logoDataUrl" />
-              </div>
-            </div>
-          </div>
-        </form>
+        <QrCodeForm
+          form={form}
+          qrType={qr?.type}
+          remoteUsers={collab.remoteUsers}
+          onUpdateField={updateField}
+          onFieldFocus={handleFieldFocus}
+          onFieldBlur={handleFieldBlur}
+          onLogoUpload={handleLogoUpload}
+          fileInputRef={fileInputRef}
+        />
 
         <div className="lg:col-span-2 space-y-5">
           <OnlineUsers
@@ -485,66 +342,17 @@ export default function QrCodeEdit() {
             onReconnect={collab.reconnect}
           />
 
-          <div className="card p-6 sticky top-6">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="font-semibold text-white">实时预览</h3>
-              <div className="flex gap-1">
-                <button type="button" onClick={handleDownloadPreview} className="btn-secondary text-sm px-3 py-1.5">
-                  <Download className="w-4 h-4" />
-                  PNG
-                </button>
-                <button type="button" onClick={() => handleServerDownload("svg")} className="btn-secondary text-sm px-3 py-1.5">
-                  <Download className="w-4 h-4" />
-                  SVG
-                </button>
-              </div>
-            </div>
-
-            <div
-              ref={qrRef}
-              className="relative w-full aspect-square rounded-xl p-6 flex items-center justify-center dot-pattern border border-dark-700"
-              style={{ background: form.background }}
-            >
-              <QRCodeCanvas
-                value={previewValue}
-                size={Math.min(form.size, 360)}
-                bgColor={form.background}
-                fgColor={form.foreground}
-                level={form.logoDataUrl ? (form.errorLevel === "L" || form.errorLevel === "M" ? "H" : form.errorLevel) : form.errorLevel}
-                imageSettings={
-                  form.logoDataUrl
-                    ? {
-                        src: form.logoDataUrl,
-                        height: Math.round(Math.min(form.size, 360) * 0.2),
-                        width: Math.round(Math.min(form.size, 360) * 0.2),
-                        excavate: true,
-                      }
-                    : undefined
-                }
-              />
-            </div>
-
-            <div className="mt-4 space-y-2 text-sm">
-              <div className="flex justify-between py-2 border-b border-dark-700">
-                <span className="text-dark-400">扫码次数</span>
-                <span className="text-brand-400 font-semibold">{qr?.scanCount.toLocaleString() || 0}</span>
-              </div>
-              <div className="flex justify-between py-2 border-b border-dark-700">
-                <span className="text-dark-400">尺寸</span>
-                <span className="text-white">{form.size}px</span>
-              </div>
-              <div className="flex justify-between py-2 border-b border-dark-700">
-                <span className="text-dark-400">容错</span>
-                <span className="text-white">Level {form.errorLevel}</span>
-              </div>
-              <div className="flex justify-between py-2">
-                <span className="text-dark-400">状态</span>
-                <span>{qr?.enabled ? <span className="tag-green">已启用</span> : <span className="tag-red">已停用</span>}</span>
-              </div>
-            </div>
-          </div>
+          <QrCodePreview
+            form={form}
+            qr={qr}
+            qrRef={qrRef}
+            onDownloadPreview={handleDownloadPreview}
+            onServerDownload={handleServerDownload}
+          />
         </div>
       </div>
+
+      <form id="qr-form" onSubmit={handleSubmit} className="hidden" />
     </div>
   );
 }

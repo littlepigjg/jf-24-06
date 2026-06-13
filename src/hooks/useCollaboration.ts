@@ -1,54 +1,28 @@
 import { useRef, useEffect, useCallback, useState } from 'react'
-import type { CollabMessage, CollabUser, CollabOperation } from '@shared/types'
+import type { CollabMessage, CollabUser } from '@shared/types'
+import { CollabConnection, generateUserId } from '@/lib/collabConnection'
+import type { RemoteChange, ConflictInfo, CollaborationState } from '@/types/collab'
 
-interface RemoteChange {
-  field: string
-  value: unknown
-  userId: string
-  operation: CollabOperation
+export type { ConflictInfo } from '@/types/collab'
+
+export interface UseCollaborationReturn extends CollaborationState {
+  sendFieldFocus: (field: string) => void
+  sendFieldBlur: (field: string) => void
+  sendFieldChange: (field: string, value: unknown, oldValue: unknown) => void
+  sendCursor: (field: string, position: number) => void
+  resolveConflict: (field: string, resolution: 'yours' | 'theirs', yourValue: unknown) => void
+  consumeRemoteChange: () => RemoteChange | undefined
+  consumeAllRemoteChanges: () => RemoteChange[]
+  reconnect: () => void
+  onRemoteChange: (callback: (change: RemoteChange) => void) => () => void
+  syncReady: boolean
 }
 
-export interface ConflictInfo {
-  field: string
-  yourValue: unknown
-  theirValue: unknown
-  operation: CollabOperation
-}
-
-interface CollaborationState {
-  connected: boolean
-  connecting: boolean
-  userId: string
-  user: CollabUser | null
-  remoteUsers: CollabUser[]
-  remoteChanges: RemoteChange[]
-  conflicts: ConflictInfo[]
-  syncedState: Record<string, unknown> | null
-  revision: number
-}
-
-function generateUserId(): string {
-  return `u-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-}
-
-const RECONNECT_BASE_DELAY = 1000
-const MAX_RECONNECT_DELAY = 30000
-const HEARTBEAT_INTERVAL = 25000
-
-export function useCollaboration(sessionId: string | undefined) {
-  const wsRef = useRef<WebSocket | null>(null)
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const reconnectAttemptsRef = useRef(0)
-  const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const userIdRef = useRef(generateUserId())
-  const sessionIdRef = useRef(sessionId)
-  const pendingAckRef = useRef<Map<string, { field: string; value: unknown; timeout: ReturnType<typeof setTimeout> }>>(new Map())
-  const mountedRef = useRef(true)
-
+export function useCollaboration(sessionId: string | undefined): UseCollaborationReturn {
   const [state, setState] = useState<CollaborationState>({
     connected: false,
     connecting: false,
-    userId: userIdRef.current,
+    userId: '',
     user: null,
     remoteUsers: [],
     remoteChanges: [],
@@ -57,70 +31,60 @@ export function useCollaboration(sessionId: string | undefined) {
     revision: 0,
   })
 
+  const [syncReady, setSyncReady] = useState(false)
+
+  const userIdRef = useRef(generateUserId())
+  const sessionIdRef = useRef(sessionId)
+  const connectionRef = useRef<CollabConnection | null>(null)
+  const remoteChangeCallbacksRef = useRef<Set<(change: RemoteChange) => void>>(new Set())
+  const syncAppliedRef = useRef(false)
+
   sessionIdRef.current = sessionId
 
-  const clearTimers = useCallback(() => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current)
-      reconnectTimerRef.current = null
-    }
-    if (heartbeatTimerRef.current) {
-      clearInterval(heartbeatTimerRef.current)
-      heartbeatTimerRef.current = null
-    }
-  }, [])
-
-  const sendMessage = useCallback((msg: CollabMessage) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg))
+  const onRemoteChange = useCallback((callback: (change: RemoteChange) => void) => {
+    remoteChangeCallbacksRef.current.add(callback)
+    return () => {
+      remoteChangeCallbacksRef.current.delete(callback)
     }
   }, [])
 
   const connect = useCallback(() => {
     if (!sessionIdRef.current) return
-    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
-      return
+
+    const connection = new CollabConnection({
+      sessionId: sessionIdRef.current,
+      userId: userIdRef.current,
+      onConnect: () => {
+        setState((s) => ({ ...s, connected: true, connecting: false }))
+      },
+      onDisconnect: () => {
+        setState((s) => ({ ...s, connected: false, connecting: false }))
+      },
+    })
+
+    connection.setOnMessage((msg: CollabMessage) => {
+      handleMessage(msg)
+    })
+
+    connectionRef.current = connection
+    connection.connect()
+    setState((s) => ({ ...s, connecting: true, userId: userIdRef.current }))
+  }, [])
+
+  const disconnect = useCallback(() => {
+    if (connectionRef.current) {
+      connectionRef.current.disconnect()
+      connectionRef.current = null
     }
+  }, [])
 
-    setState((s) => ({ ...s, connecting: true }))
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const host = window.location.host
-    const wsUrl = `${protocol}//${host}/ws/collab`
-
-    const ws = new WebSocket(wsUrl)
-    wsRef.current = ws
-
-    ws.onopen = () => {
-      if (!mountedRef.current) return
-      reconnectAttemptsRef.current = 0
-      setState((s) => ({ ...s, connected: true, connecting: false }))
-
-      ws.send(JSON.stringify({
-        type: 'join',
-        sessionId: sessionIdRef.current,
-        userId: userIdRef.current,
-        user: { id: userIdRef.current, name: '', color: '' },
-      }))
-
-      heartbeatTimerRef.current = setInterval(() => {
-        sendMessage({ type: 'pong', sessionId: sessionIdRef.current || '' })
-      }, HEARTBEAT_INTERVAL)
-    }
-
-    ws.onmessage = (event) => {
-      if (!mountedRef.current) return
-      let msg: CollabMessage
-      try {
-        msg = JSON.parse(event.data) as CollabMessage
-      } catch {
-        return
-      }
-
-      switch (msg.type) {
-        case 'sync_state': {
-          const user = msg.user || null
-          userIdRef.current = msg.userId || userIdRef.current
+  const handleMessage = useCallback((msg: CollabMessage) => {
+    switch (msg.type) {
+      case 'sync_state': {
+        const user = msg.user || null
+        userIdRef.current = msg.userId || userIdRef.current
+        if (!syncAppliedRef.current) {
+          syncAppliedRef.current = true
           setState((s) => ({
             ...s,
             user,
@@ -128,187 +92,149 @@ export function useCollaboration(sessionId: string | undefined) {
             syncedState: msg.state || null,
             revision: msg.revision || 0,
           }))
-          break
+          setSyncReady(true)
         }
+        break
+      }
 
-        case 'user_list': {
+      case 'user_list': {
+        setState((s) => ({
+          ...s,
+          remoteUsers: (msg.users || []).filter((u) => u.id !== s.userId),
+        }))
+        break
+      }
+
+      case 'join': {
+        if (msg.userId !== userIdRef.current && msg.user) {
           setState((s) => ({
             ...s,
-            remoteUsers: (msg.users || []).filter((u) => u.id !== s.userId),
+            remoteUsers: [...s.remoteUsers.filter((u) => u.id !== msg.userId), msg.user!],
           }))
-          break
         }
+        break
+      }
 
-        case 'join': {
-          if (msg.userId !== userIdRef.current) {
-            setState((s) => ({
-              ...s,
-              remoteUsers: [...s.remoteUsers.filter((u) => u.id !== msg.userId), msg.user!].filter((u) => u.id !== s.userId),
-            }))
+      case 'leave': {
+        setState((s) => ({
+          ...s,
+          remoteUsers: s.remoteUsers.filter((u) => u.id !== msg.userId),
+        }))
+        break
+      }
+
+      case 'cursor':
+      case 'field_focus': {
+        setState((s) => ({
+          ...s,
+          remoteUsers: s.remoteUsers.map((u) =>
+            u.id === msg.userId
+              ? {
+                  ...u,
+                  ...(msg.type === 'cursor' ? { cursorPosition: msg.value as number } : {}),
+                  ...(msg.type === 'field_focus' ? { activeField: msg.field } : {}),
+                }
+              : u
+          ),
+        }))
+        break
+      }
+
+      case 'field_blur': {
+        setState((s) => ({
+          ...s,
+          remoteUsers: s.remoteUsers.map((u) =>
+            u.id === msg.userId
+              ? { ...u, activeField: undefined, cursorPosition: undefined }
+              : u
+          ),
+        }))
+        break
+      }
+
+      case 'field_change': {
+        const change: RemoteChange = {
+          field: msg.field || '',
+          value: msg.value,
+          userId: msg.userId || '',
+          operation: msg.operation!,
+        }
+        if (msg.userId !== userIdRef.current) {
+          remoteChangeCallbacksRef.current.forEach((cb) => cb(change))
+        }
+        setState((s) => ({
+          ...s,
+          remoteChanges: [...s.remoteChanges, change],
+          revision: msg.operation?.revision || s.revision,
+        }))
+        break
+      }
+
+      case 'field_change_ack': {
+        if (msg.operation) {
+          const change: RemoteChange = {
+            field: msg.field || '',
+            value: msg.value,
+            userId: userIdRef.current,
+            operation: msg.operation!,
           }
-          break
-        }
-
-        case 'leave': {
+          remoteChangeCallbacksRef.current.forEach((cb) => cb(change))
           setState((s) => ({
             ...s,
-            remoteUsers: s.remoteUsers.filter((u) => u.id !== msg.userId),
+            revision: msg.revision || s.revision,
           }))
-          break
         }
+        break
+      }
 
-        case 'cursor':
-        case 'field_focus': {
-          setState((s) => ({
-            ...s,
-            remoteUsers: s.remoteUsers.map((u) =>
-              u.id === msg.userId
-                ? {
-                    ...u,
-                    ...(msg.type === 'cursor' ? { cursorPosition: msg.value as number } : {}),
-                    ...(msg.type === 'field_focus' ? { activeField: msg.field } : {}),
-                  }
-                : u
-            ),
-          }))
-          break
+      case 'conflict': {
+        const newConflict: ConflictInfo = {
+          field: msg.conflictField || msg.field || '',
+          yourValue: msg.value,
+          theirValue: msg.oldValue,
+          operation: msg.operation!,
         }
-
-        case 'field_blur': {
-          setState((s) => ({
-            ...s,
-            remoteUsers: s.remoteUsers.map((u) =>
-              u.id === msg.userId
-                ? { ...u, activeField: undefined, cursorPosition: undefined }
-                : u
-            ),
-          }))
-          break
-        }
-
-        case 'field_change': {
-          if (msg.userId !== userIdRef.current && msg.operation) {
-            setState((s) => ({
-              ...s,
-              remoteChanges: [
-                ...s.remoteChanges,
-                {
-                  field: msg.field || '',
-                  value: msg.value,
-                  userId: msg.userId || '',
-                  operation: msg.operation!,
-                },
-              ],
-              revision: msg.operation?.revision || s.revision,
-            }))
-          }
-          break
-        }
-
-        case 'field_change_ack': {
-          if (msg.operation) {
-            const opId = msg.operation.id
-            const pending = pendingAckRef.current.get(opId)
-            if (pending) {
-              clearTimeout(pending.timeout)
-              pendingAckRef.current.delete(opId)
-            }
-            setState((s) => ({
-              ...s,
-              revision: msg.revision || s.revision,
-            }))
-          }
-          break
-        }
-
-        case 'conflict': {
-          setState((s) => ({
-            ...s,
-            conflicts: [
-              ...s.conflicts,
-              {
-                field: msg.conflictField || msg.field || '',
-                yourValue: msg.value,
-                theirValue: msg.oldValue,
-                operation: msg.operation!,
-              },
-            ],
-          }))
-          break
-        }
+        setState((s) => ({
+          ...s,
+          conflicts: [
+            ...s.conflicts.filter((c) => c.field !== newConflict.field),
+            newConflict,
+          ],
+        }))
+        break
       }
     }
-
-    ws.onclose = () => {
-      if (!mountedRef.current) return
-      clearTimers()
-      setState((s) => ({ ...s, connected: false, connecting: false }))
-
-      const delay = Math.min(
-        RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttemptsRef.current),
-        MAX_RECONNECT_DELAY
-      )
-      reconnectAttemptsRef.current++
-      reconnectTimerRef.current = setTimeout(() => {
-        if (mountedRef.current) connect()
-      }, delay)
-    }
-
-    ws.onerror = () => {
-      ws.close()
-    }
-  }, [clearTimers, sendMessage])
-
-  const disconnect = useCallback(() => {
-    sendMessage({
-      type: 'leave',
-      sessionId: sessionIdRef.current || '',
-      userId: userIdRef.current,
-    })
-    clearTimers()
-    reconnectAttemptsRef.current = 9999
-    if (wsRef.current) {
-      wsRef.current.close()
-      wsRef.current = null
-    }
-  }, [sendMessage, clearTimers])
+  }, [])
 
   useEffect(() => {
-    mountedRef.current = true
+    syncAppliedRef.current = false
+    setSyncReady(false)
     connect()
     return () => {
-      mountedRef.current = false
       disconnect()
     }
   }, [connect, disconnect])
 
   const sendFieldFocus = useCallback((field: string) => {
-    sendMessage({
+    connectionRef.current?.sendMessage({
       type: 'field_focus',
       sessionId: sessionIdRef.current || '',
       userId: userIdRef.current,
       field,
     })
-  }, [sendMessage])
+  }, [])
 
   const sendFieldBlur = useCallback((field: string) => {
-    sendMessage({
+    connectionRef.current?.sendMessage({
       type: 'field_blur',
       sessionId: sessionIdRef.current || '',
       userId: userIdRef.current,
       field,
     })
-  }, [sendMessage])
+  }, [])
 
   const sendFieldChange = useCallback((field: string, value: unknown, oldValue: unknown) => {
-    const opId = `${userIdRef.current}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-    const timeout = setTimeout(() => {
-      pendingAckRef.current.delete(opId)
-    }, 10000)
-
-    pendingAckRef.current.set(opId, { field, value, timeout })
-
-    sendMessage({
+    connectionRef.current?.sendMessage({
       type: 'field_change',
       sessionId: sessionIdRef.current || '',
       userId: userIdRef.current,
@@ -317,33 +243,36 @@ export function useCollaboration(sessionId: string | undefined) {
       oldValue,
       revision: state.revision,
     })
-  }, [sendMessage, state.revision])
+  }, [state.revision])
 
   const sendCursor = useCallback((field: string, position: number) => {
-    sendMessage({
+    connectionRef.current?.sendMessage({
       type: 'cursor',
       sessionId: sessionIdRef.current || '',
       userId: userIdRef.current,
       field,
       value: position,
     })
-  }, [sendMessage])
+  }, [])
 
   const resolveConflict = useCallback((field: string, resolution: 'yours' | 'theirs', yourValue: unknown) => {
-    sendMessage({
+    const conflict = state.conflicts.find((c) => c.field === field)
+
+    connectionRef.current?.sendMessage({
       type: 'conflict',
       sessionId: sessionIdRef.current || '',
       userId: userIdRef.current,
       conflictField: field,
       conflictResolution: resolution,
       value: yourValue,
-      oldValue: yourValue,
+      oldValue: conflict?.theirValue,
     })
+
     setState((s) => ({
       ...s,
       conflicts: s.conflicts.filter((c) => c.field !== field),
     }))
-  }, [sendMessage])
+  }, [state.conflicts])
 
   const consumeRemoteChange = useCallback(() => {
     let change: RemoteChange | undefined
@@ -365,10 +294,10 @@ export function useCollaboration(sessionId: string | undefined) {
   }, [])
 
   const reconnect = useCallback(() => {
-    disconnect()
-    reconnectAttemptsRef.current = 0
-    setTimeout(() => connect(), 100)
-  }, [disconnect, connect])
+    syncAppliedRef.current = false
+    setSyncReady(false)
+    connectionRef.current?.reconnect()
+  }, [])
 
   return {
     ...state,
@@ -380,5 +309,7 @@ export function useCollaboration(sessionId: string | undefined) {
     consumeRemoteChange,
     consumeAllRemoteChanges,
     reconnect,
+    onRemoteChange,
+    syncReady,
   }
 }

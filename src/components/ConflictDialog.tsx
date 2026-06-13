@@ -1,5 +1,5 @@
 import { AlertTriangle, Check, X } from 'lucide-react'
-import type { ConflictInfo } from '@/hooks/useCollaboration'
+import type { ConflictInfo } from '@/types/collab'
 
 interface ConflictDialogProps {
   conflicts: ConflictInfo[]
