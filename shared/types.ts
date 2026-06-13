@@ -110,3 +110,62 @@ export interface ApiResponse<T> {
   error?: string
   message?: string
 }
+
+export type CollabMessageType =
+  | 'join'
+  | 'leave'
+  | 'cursor'
+  | 'field_focus'
+  | 'field_blur'
+  | 'field_change'
+  | 'field_change_ack'
+  | 'sync_state'
+  | 'user_list'
+  | 'conflict'
+  | 'pong'
+
+export interface CollabUser {
+  id: string
+  name: string
+  color: string
+  activeField?: string
+  cursorPosition?: number
+}
+
+export interface CollabOperation {
+  id: string
+  userId: string
+  field: string
+  oldValue: unknown
+  newValue: unknown
+  timestamp: number
+  revision: number
+}
+
+export interface CollabMessage {
+  type: CollabMessageType
+  sessionId: string
+  userId?: string
+  user?: CollabUser
+  users?: CollabUser[]
+  field?: string
+  value?: unknown
+  oldValue?: unknown
+  operation?: CollabOperation
+  state?: Record<string, unknown>
+  revision?: number
+  conflictField?: string
+  conflictResolution?: 'server' | 'yours' | 'theirs'
+  timestamp?: number
+}
+
+export const COLLAB_COLORS = [
+  '#3b82f6',
+  '#8b5cf6',
+  '#ec4899',
+  '#f59e0b',
+  '#10b981',
+  '#06b6d4',
+  '#f97316',
+  '#6366f1',
+]

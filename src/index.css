@@ -121,3 +121,13 @@ body {
   background-image: radial-gradient(rgba(148, 163, 184, 0.18) 1px, transparent 1px);
   background-size: 10px 10px;
 }
+
+@keyframes collab-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+}
+
+[data-collab-field] {
+  position: relative;
+  transition: box-shadow 0.3s ease;
+}

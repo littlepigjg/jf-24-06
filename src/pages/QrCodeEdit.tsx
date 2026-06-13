@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { QRCodeCanvas } from "qrcode.react";
 import {
@@ -16,6 +16,10 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { QrCode, UpdateQrCodeRequest, ErrorLevel } from "@shared/types";
+import { useCollaboration } from "@/hooks/useCollaboration";
+import OnlineUsers from "@/components/OnlineUsers";
+import { CollabFieldIndicator } from "@/components/CollabCursors";
+import ConflictDialog from "@/components/ConflictDialog";
 
 interface FormState {
   name: string;
@@ -44,6 +48,10 @@ export default function QrCodeEdit() {
   const [saving, setSaving] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const qrRef = useRef<HTMLDivElement>(null);
+  const lastSentRef = useRef<Record<string, unknown>>({});
+  const debounceTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  const collab = useCollaboration(id);
 
   useEffect(() => {
     api
@@ -89,9 +97,64 @@ export default function QrCodeEdit() {
       .finally(() => setLoading(false));
   }, [id]);
 
-  const updateField = <K extends keyof FormState>(key: K, value: FormState[K]) => {
+  useEffect(() => {
+    if (collab.syncedState && form) {
+      setForm((prev) => {
+        if (!prev) return prev;
+        const updated = { ...prev };
+        const state = collab.syncedState!;
+        if (state.name !== undefined) updated.name = state.name as string;
+        if (state.targetUrl !== undefined) updated.targetUrl = state.targetUrl as string;
+        if (state.size !== undefined) updated.size = state.size as number;
+        if (state.foreground !== undefined) updated.foreground = state.foreground as string;
+        if (state.background !== undefined) updated.background = state.background as string;
+        if (state.errorLevel !== undefined) updated.errorLevel = state.errorLevel as ErrorLevel;
+        if (state.logoDataUrl !== undefined) updated.logoDataUrl = state.logoDataUrl as string;
+        return updated;
+      });
+    }
+  }, [collab.syncedState]);
+
+  useEffect(() => {
+    const changes = collab.consumeAllRemoteChanges();
+    if (changes.length > 0 && form) {
+      setForm((prev) => {
+        if (!prev) return prev;
+        const updated = { ...prev };
+        for (const change of changes) {
+          const key = change.field as keyof FormState;
+          if (key in updated) {
+            (updated as Record<string, unknown>)[key] = change.value;
+          }
+        }
+        return updated;
+      });
+    }
+  });
+
+  const updateField = useCallback(<K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm((f) => (f ? { ...f, [key]: value } : f));
-  };
+
+    const oldVal = lastSentRef.current[key];
+    if (oldVal === value) return;
+    lastSentRef.current[key] = value;
+
+    const existing = debounceTimersRef.current.get(key);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(() => {
+      collab.sendFieldChange(key, value, oldVal);
+    }, 150);
+    debounceTimersRef.current.set(key, timer);
+  }, [collab]);
+
+  const handleFieldFocus = useCallback((field: string) => {
+    collab.sendFieldFocus(field);
+  }, [collab]);
+
+  const handleFieldBlur = useCallback((field: string) => {
+    collab.sendFieldBlur(field);
+  }, [collab]);
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -151,6 +214,7 @@ export default function QrCodeEdit() {
         errorLevel: qr.errorLevel,
         logoDataUrl: qr.logoDataUrl,
       });
+      lastSentRef.current = {};
     }
   };
 
@@ -192,6 +256,11 @@ export default function QrCodeEdit() {
 
   return (
     <div className="space-y-6">
+      <ConflictDialog
+        conflicts={collab.conflicts}
+        onResolve={collab.resolveConflict}
+      />
+
       <div className="flex items-center justify-between flex-wrap gap-4">
         <div className="flex items-center gap-3">
           <Link to="/qrcodes" className="btn-ghost p-2" title="返回列表">
@@ -203,6 +272,9 @@ export default function QrCodeEdit() {
               短码：<span className="text-brand-400 font-mono">/{qr?.shortCode}</span>
               {qr?.type === "static" && <span className="tag-gray ml-2">静态码</span>}
               {qr?.type === "dynamic" && <span className="tag-blue ml-2">动态码</span>}
+              {collab.remoteUsers.length > 0 && (
+                <span className="tag-green ml-2">{collab.remoteUsers.length + 1} 人协作中</span>
+              )}
             </p>
           </div>
         </div>
@@ -226,7 +298,7 @@ export default function QrCodeEdit() {
         <form id="qr-form" onSubmit={handleSubmit} className="lg:col-span-3 space-y-5">
           <div className="card p-5 space-y-5">
             <div className="grid grid-cols-1 gap-4">
-              <div>
+              <div data-collab-field="name">
                 <label className="label">
                   <Hash className="w-3.5 h-3.5 inline mr-1" />
                   二维码名称 *
@@ -237,10 +309,13 @@ export default function QrCodeEdit() {
                   placeholder="例如：活动海报-2024春季"
                   value={form.name}
                   onChange={(e) => updateField("name", e.target.value)}
+                  onFocus={() => handleFieldFocus("name")}
+                  onBlur={() => handleFieldBlur("name")}
                 />
+                <CollabFieldIndicator users={collab.remoteUsers} field="name" />
               </div>
 
-              <div>
+              <div data-collab-field="targetUrl">
                 <label className="label">
                   <Link2 className="w-3.5 h-3.5 inline mr-1" />
                   目标URL *
@@ -251,12 +326,15 @@ export default function QrCodeEdit() {
                   placeholder="https://example.com/your-page"
                   value={form.targetUrl}
                   onChange={(e) => updateField("targetUrl", e.target.value)}
+                  onFocus={() => handleFieldFocus("targetUrl")}
+                  onBlur={() => handleFieldBlur("targetUrl")}
                 />
                 {qr?.type === "static" && (
                   <p className="text-xs text-warning-500 mt-1">
                     ⚠ 静态码已生成，修改目标URL后旧码将失效
                   </p>
                 )}
+                <CollabFieldIndicator users={collab.remoteUsers} field="targetUrl" />
               </div>
             </div>
           </div>
@@ -268,7 +346,7 @@ export default function QrCodeEdit() {
             </h3>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
+              <div data-collab-field="size">
                 <label className="label">
                   <Maximize2 className="w-3.5 h-3.5 inline mr-1" />
                   尺寸
@@ -279,6 +357,8 @@ export default function QrCodeEdit() {
                       key={s}
                       type="button"
                       onClick={() => updateField("size", s)}
+                      onFocus={() => handleFieldFocus("size")}
+                      onBlur={() => handleFieldBlur("size")}
                       className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
                         form.size === s
                           ? "bg-brand-gradient text-white shadow-glow-sm"
@@ -289,14 +369,17 @@ export default function QrCodeEdit() {
                     </button>
                   ))}
                 </div>
+                <CollabFieldIndicator users={collab.remoteUsers} field="size" />
               </div>
 
-              <div>
+              <div data-collab-field="errorLevel">
                 <label className="label">容错级别</label>
                 <select
                   className="input"
                   value={form.errorLevel}
                   onChange={(e) => updateField("errorLevel", e.target.value as ErrorLevel)}
+                  onFocus={() => handleFieldFocus("errorLevel")}
+                  onBlur={() => handleFieldBlur("errorLevel")}
                 >
                   {errorLevelOptions.map((o) => (
                     <option key={o.value} value={o.value}>
@@ -304,9 +387,10 @@ export default function QrCodeEdit() {
                     </option>
                   ))}
                 </select>
+                <CollabFieldIndicator users={collab.remoteUsers} field="errorLevel" />
               </div>
 
-              <div>
+              <div data-collab-field="foreground">
                 <label className="label">前景色</label>
                 <div className="flex gap-2">
                   <input
@@ -314,17 +398,22 @@ export default function QrCodeEdit() {
                     className="w-12 h-10 rounded-lg bg-dark-700 border border-dark-600 cursor-pointer p-1"
                     value={form.foreground}
                     onChange={(e) => updateField("foreground", e.target.value)}
+                    onFocus={() => handleFieldFocus("foreground")}
+                    onBlur={() => handleFieldBlur("foreground")}
                   />
                   <input
                     type="text"
                     className="input flex-1 font-mono text-sm"
                     value={form.foreground}
                     onChange={(e) => updateField("foreground", e.target.value)}
+                    onFocus={() => handleFieldFocus("foreground")}
+                    onBlur={() => handleFieldBlur("foreground")}
                   />
                 </div>
+                <CollabFieldIndicator users={collab.remoteUsers} field="foreground" />
               </div>
 
-              <div>
+              <div data-collab-field="background">
                 <label className="label">背景色</label>
                 <div className="flex gap-2">
                   <input
@@ -332,17 +421,22 @@ export default function QrCodeEdit() {
                     className="w-12 h-10 rounded-lg bg-dark-700 border border-dark-600 cursor-pointer p-1"
                     value={form.background}
                     onChange={(e) => updateField("background", e.target.value)}
+                    onFocus={() => handleFieldFocus("background")}
+                    onBlur={() => handleFieldBlur("background")}
                   />
                   <input
                     type="text"
                     className="input flex-1 font-mono text-sm"
                     value={form.background}
                     onChange={(e) => updateField("background", e.target.value)}
+                    onFocus={() => handleFieldFocus("background")}
+                    onBlur={() => handleFieldBlur("background")}
                   />
                 </div>
+                <CollabFieldIndicator users={collab.remoteUsers} field="background" />
               </div>
 
-              <div className="md:col-span-2">
+              <div className="md:col-span-2" data-collab-field="logoDataUrl">
                 <label className="label">中心 Logo （可选，建议2MB以内）</label>
                 <div className="flex items-start gap-3 flex-wrap">
                   <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-secondary">
@@ -376,12 +470,21 @@ export default function QrCodeEdit() {
                     建议使用正方形 PNG，容错级别建议选 Q 或 H
                   </p>
                 </div>
+                <CollabFieldIndicator users={collab.remoteUsers} field="logoDataUrl" />
               </div>
             </div>
           </div>
         </form>
 
         <div className="lg:col-span-2 space-y-5">
+          <OnlineUsers
+            remoteUsers={collab.remoteUsers}
+            currentUser={collab.user}
+            connected={collab.connected}
+            connecting={collab.connecting}
+            onReconnect={collab.reconnect}
+          />
+
           <div className="card p-6 sticky top-6">
             <div className="flex items-center justify-between mb-4">
               <h3 className="font-semibold text-white">实时预览</h3>
